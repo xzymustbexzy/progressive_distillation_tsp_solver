@@ -1,0 +1,106 @@
+import torch
+from typing import NamedTuple
+from utils.boolmask import mask_long2bool, mask_long_scatter
+
+
+class StateTSP(NamedTuple):
+    # Fixed input
+    loc: torch.Tensor
+    dist: torch.Tensor
+
+    # If this state contains multiple copies (i.e. beam search) for the same instance, then for memory efficiency
+    # the loc and dist tensors are not kept multiple times, so we need to use the ids to index the correct rows.
+    ids: torch.Tensor  # Keeps track of original fixed data index of rows
+
+    # State
+    first_a: torch.Tensor
+    prev_a: torch.Tensor
+    visited_: torch.Tensor  # Keeps track of nodes that have been visited
+    i: int  # Keeps track of step
+
+    @property
+    def visited(self):
+        if self.visited_.dtype == torch.uint8:
+            return self.visited_
+        else:
+            return mask_long2bool(self.visited_, n=self.loc.size(-2))
+
+    def __getitem__(self, key):
+        assert torch.is_tensor(key) or isinstance(key, slice)  # If tensor, idx all tensors by this tensor:
+        return self._replace(
+            ids=self.ids[key],
+            first_a=self.first_a[key],
+            prev_a=self.prev_a[key],
+            visited_=self.visited_[key],
+        )
+
+    @staticmethod
+    def initialize(loc, visited_dtype=torch.uint8):
+
+        batch_size, n_loc, _ = loc.size()
+        prev_a = torch.zeros(batch_size, 1, dtype=torch.long, device=loc.device)
+        return StateTSP(
+            loc=loc,
+            dist=(loc[:, :, None, :] - loc[:, None, :, :]).norm(p=2, dim=-1),
+            ids=torch.arange(batch_size, dtype=torch.int64, device=loc.device)[:, None],  # Add steps dimension
+            first_a=prev_a,
+            prev_a=prev_a,
+            # Keep visited with depot so we can scatter efficiently (if there is an action for depot)
+            visited_=(  # Visited as mask is easier to understand, as long more memory efficient
+                torch.zeros(
+                    batch_size, 1, n_loc,
+                    dtype=torch.uint8, device=loc.device
+                )
+                if visited_dtype == torch.uint8
+                else torch.zeros(batch_size, 1, (n_loc + 63) // 64, dtype=torch.int64, device=loc.device)  # Ceil
+            ),
+            i=0  # Vector with length num_steps
+        )
+
+    def update(self, selected):
+
+        # Update the state
+        prev_a = selected[:, None]  # Add dimension for step
+
+        cur_coord = self.loc[self.ids, prev_a]
+
+        # Update should only be called with just 1 parallel step, in which case we can check this way if we should update
+        first_a = prev_a if self.i == 0 else self.first_a
+
+        if self.visited_.dtype == torch.uint8:
+            # Add one dimension since we write a single value
+            visited_ = self.visited_.scatter(-1, prev_a[:, :, None], 1)
+        else:
+            visited_ = mask_long_scatter(self.visited_, prev_a)
+
+        return self._replace(first_a=first_a, prev_a=prev_a, visited_=visited_, i=self.i+1)
+
+    def all_finished(self):
+        # Exactly n steps
+        return self.i >= self.loc.size(-2)
+
+    def get_current_node(self):
+        return self.prev_a
+
+    def get_mask(self, action_mask=None, k=1e9):
+        mask = self.visited > 0
+        if action_mask is None or self.i == 0:
+            return mask
+
+        if action_mask == 'knn':
+            current_nn = self.get_nn_current(k)
+            adj_mask = torch.ones_like(mask, dtype=torch.bool)
+            adj_mask = adj_mask.scatter_(-1, current_nn, torch.zeros_like(mask)!=0)
+            mask = torch.logical_or(mask, adj_mask)
+
+        return mask
+
+    def get_nn_current(self, k=None):
+        k = min(k, self.loc.size(-2) - self.i)  # Number of remaining
+        return (
+            self.dist[
+                self.ids,
+                self.prev_a
+            ] +
+            self.visited.float() * 1e6
+        ).topk(k, dim=-1, largest=False)[1]
